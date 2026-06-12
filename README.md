@@ -9,7 +9,7 @@ tags:
 ---
 # sd-cli — multi-arch stable-diffusion.cpp builds (incl. Blackwell)
 
-Prebuilt `sd-cli` binaries from leejet/stable-diffusion.cpp @ `master-656-0e4ee04`,
+Prebuilt `sd-cli` binaries from leejet/stable-diffusion.cpp,
 plus the build recipe. Two CUDA variants, each a fat binary covering every NVIDIA
 GPU architecture from its floor up through Blackwell.
 
