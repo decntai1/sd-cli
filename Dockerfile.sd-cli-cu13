@@ -1,0 +1,86 @@
+# Dockerfile.sd-cli-cu13 — arch-correct multi-arch sd-cli (CUDA 13 toolchain)
+# ---------------------------------------------------------------------------
+# Companion to Dockerfile.sd-cli-cu12. Same upstream repo + ref + feature flags;
+# the ONLY difference between the two images is the CUDA toolkit and therefore
+# the architecture list. See Dockerfile.sd-cli-cu12 for the full "why".
+#
+# WHY A SEPARATE CUDA 13 IMAGE
+#   setup.py picks the prebuilt by driver: `cu13` when the host CUDA major >= 13,
+#   else `cu12` (downloads/setup.py fetch_or_build_sdcli). A binary built against
+#   the CUDA 13 runtime needs the CUDA 13 toolchain. Blackwell boxes on a CUDA 13
+#   driver pull THIS one.
+#
+# CUDA 13 RAISED ITS ARCH FLOOR — the lists differ BY DESIGN.
+#   CUDA 13 dropped the older virtual/real arches (Maxwell sm_50/52/53, Pascal
+#   sm_60/61/62, and Volta sm_70). Its supported floor is Turing sm_75. So the
+#   cu13 list starts at 75-real (NOT 70-real like cu12) and runs up through 120:
+#   75-real   Turing     (RTX 20xx, T4)
+#   80-real   Ampere     (A100)
+#   86-real   Ampere     (RTX 30xx, A10, A40)
+#   89-real   Ada        (RTX 40xx, L4, L40)
+#   90-real   Hopper     (H100, H200)
+#   100-real  Blackwell DC (B100/B200)
+#   120-real  Blackwell  (RTX 50xx)  <-- the whole point
+#   120-virtual  PTX tail for compute_120 (JIT forward-compat)
+#   Putting 70-real here would FAIL the build (sm_70 unsupported in CUDA 13) —
+#   that is the intended divergence, not an omission. Volta/Pascal/Maxwell users
+#   stay on the cu12 binary, which setup.py already routes them to.
+#
+# VERIFY: the build prints `nvcc --list-gpu-arch` (CUDA 13) below. If cmake errors
+# on an unsupported arch, reconcile CUDA_ARCHS against that printout.
+# ---------------------------------------------------------------------------
+
+# CUDA 13 devel. Keep ubuntu22.04 (glibc 2.35) for binary portability, matching
+# the cu12 image. VERIFIED 2026-06-11: nvidia/cuda:13.0.1-devel-ubuntu22.04 DOES
+# exist on Docker Hub, so cu13 stays on 22.04 / glibc 2.35 — NO elevated glibc
+# floor vs cu12. (13.0.1-devel-ubuntu24.04 also exists; only fall back to it if a
+# future 13.x drops the 22.04 variant — that would raise the binary's floor to
+# glibc 2.39 on provider boxes, so note it on swap if you ever do.)
+FROM nvidia/cuda:13.0.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git cmake build-essential binutils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Same locked upstream as the golden recipe and the cu12 image. Pinned to the
+# leejet release TAG master-656-0e4ee04 (full SHA
+# 0e4ee04488159b81d95a9ffcd983a077fd5dcb77, dated 2026-05-28) — a named tag,
+# not a bare short hash. All four required flags (--ref-image, --llm_vision,
+# vid_gen, --diffusion-fa) are present in examples/common/common.cpp at this ref.
+ARG SDCPP_REPO=https://github.com/leejet/stable-diffusion.cpp
+ARG SDCPP_REF=master-656-0e4ee04
+
+# Broadest set CUDA 13 supports (floor = sm_75), ALWAYS including 120-real +
+# 120-virtual. NOTE the absence of 70-real vs the cu12 list — intentional.
+ARG CUDA_ARCHS="75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+
+WORKDIR /opt
+RUN git clone "${SDCPP_REPO}" sdcpp \
+ && cd sdcpp \
+ && git checkout "${SDCPP_REF}" \
+ && git submodule update --init --recursive
+
+WORKDIR /opt/sdcpp
+
+RUN echo "=== nvcc --list-gpu-arch (CUDA 13) ===" && nvcc --list-gpu-arch && \
+    echo "=== CMAKE_CUDA_ARCHITECTURES = ${CUDA_ARCHS} ==="
+
+RUN cmake -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DSD_CUDA=ON -DSD_WEBM=ON -DSD_WEBP=ON \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+ && cmake --build build --config Release --target sd-cli -j"$(nproc)"
+
+RUN mkdir -p /out \
+ && cp "$(find build -name sd-cli -type f -perm -u+x | head -n1)" /out/sd-cli \
+ && chmod 755 /out/sd-cli \
+ && echo "sd-cli (cu13 fat binary) staged at /out/sd-cli"
+
+# Flag sanity — GPU-FREE (see Dockerfile.sd-cli-cu12 for the full why). The build
+# sandbox has no GPU, so running `/out/sd-cli --help` can error before printing and
+# falsely report "missing flags". Check the binary's string table instead — no CUDA
+# needed. The real runtime check runs WITH the GPU in build-and-validate-sd-cli.sh.
+RUN strings /out/sd-cli | grep -E -- '--ref-image|--llm_vision|vid_gen|--diffusion-fa' \
+      || (echo "BUILD MISSING REQUIRED FLAG LITERALS — wrong ref?" && exit 1)

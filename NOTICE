@@ -1,0 +1,6 @@
+Prebuilt sd-cli binaries (in Releases) are compiled from:
+  stable-diffusion.cpp - https://github.com/leejet/stable-diffusion.cpp (MIT)
+  ggml                 - https://github.com/ggml-org/ggml (MIT)
+built at ref master-656-0e4ee04. Credit for the inference engine goes to
+leejet and the ggml authors. This repo adds only a multi-arch build recipe
+(CUDA 12/13, sm_70 through sm_120 incl. Blackwell).

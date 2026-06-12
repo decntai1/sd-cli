@@ -1,0 +1,109 @@
+# Dockerfile.sd-cli-cu12 — arch-correct multi-arch sd-cli (CUDA 12.8 toolchain)
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS
+#   The prebuilt sd-cli currently shipped at /download/sd-cli-cu12 was compiled
+#   on CUDA 12.4 with NO CMAKE_CUDA_ARCHITECTURES, so it emits no sm_120 SASS
+#   and throws "no kernel image is available for execution on the device" on
+#   Blackwell (RTX 50-series, sm_120) cards. sd-cli powers EVERY sdcpp model
+#   (z-image, SD3.5, FLUX.2-klein, HiDream, WAN), so all of them are dead on
+#   Blackwell until this fat binary replaces it.
+#
+# WHAT CHANGED vs the golden recipe
+#   NOTHING except the architecture list. Same upstream repo, same pinned ref,
+#   same feature flags (-DSD_CUDA=ON -DSD_WEBM=ON -DSD_WEBP=ON). The ONLY added
+#   flag is -DCMAKE_CUDA_ARCHITECTURES, which makes this a strict SUPERSET of
+#   the current binary: it still runs on every card the old one did (Turing,
+#   Ampere, Ada, Hopper) AND adds Blackwell (sm_120) + a 120-virtual PTX tail
+#   for forward-compat JIT on future archs.
+#
+# ARCH LIST (CUDA 12.8 — broad coverage of older cards)
+#   70-real   Volta      (V100)
+#   75-real   Turing     (RTX 20xx, T4, GTX 16xx)
+#   80-real   Ampere     (A100)
+#   86-real   Ampere     (RTX 30xx, A10, A40)
+#   89-real   Ada        (RTX 40xx, L4, L40)
+#   90-real   Hopper     (H100, H200)
+#   100-real  Blackwell DC (B100/B200, GB100)
+#   120-real  Blackwell  (RTX 50xx, GB202)  <-- the whole point
+#   120-virtual  PTX tail for compute_120 (JIT forward-compat)
+#   The "-real" suffix bakes SASS cubins; "-virtual" bakes PTX. CUDA 12.8 is the
+#   first toolkit that supports sm_100 + sm_120, so 12.8.x is the FLOOR for this
+#   image — do not downgrade the base.
+#
+# VERIFY THE LIST: the build prints `nvcc --list-gpu-arch` below. If cmake errors
+# with "unsupported gpu architecture", reconcile CUDA_ARCHS against that printout
+# (a listed-but-unsupported arch fails the build — that is the guard, by design).
+#
+# This image is NOT shipped. The operator builds it, extracts /out/sd-cli, and
+# (after Blackwell validation + Ada/Ampere regression) scp's the binary to the
+# VPS. See docs/build/build-and-validate-sd-cli.sh.
+# ---------------------------------------------------------------------------
+
+# CUDA 12.8 devel (toolchain + headers). 22.04 base → glibc 2.35 floor, which
+# keeps the extracted binary portable across the varied provider boxes that pull
+# it. Bump the patch tag (12.8.x) only to another tag that exists on Docker Hub.
+# Tag VERIFIED present on Docker Hub 2026-06-11 (nvidia/cuda registry).
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git cmake build-essential binutils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Identical upstream source to the golden recipe ------------------------
+# Repo + ref are LOCKED to what docs/golden-provider-image.md validated. These
+# pin the feature set (--ref-image, --llm_vision, vid_gen, --diffusion-fa) that
+# image-edit + video depend on. DO NOT change the repo or ref to "add arches" —
+# arches are added purely via CMAKE_CUDA_ARCHITECTURES below.
+ARG SDCPP_REPO=https://github.com/leejet/stable-diffusion.cpp
+# Pinned to the leejet release TAG master-656-0e4ee04 (full SHA
+# 0e4ee04488159b81d95a9ffcd983a077fd5dcb77, dated 2026-05-28). A named release
+# tag is preferred over a bare 7-char short hash: immutable, unambiguous as the
+# repo grows, and self-documenting. This is the SAME commit the golden recipe
+# validated — all four required flags (--ref-image, --llm_vision, vid_gen,
+# --diffusion-fa) are registered in examples/common/common.cpp at this ref, so
+# the build carries them. See docs/golden-provider-image.md (SOURCE OF TRUTH).
+ARG SDCPP_REF=master-656-0e4ee04
+
+# Broadest set CUDA 12.8 supports, ALWAYS including 120-real + 120-virtual.
+ARG CUDA_ARCHS="70-real;75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+
+WORKDIR /opt
+RUN git clone "${SDCPP_REPO}" sdcpp \
+ && cd sdcpp \
+ && git checkout "${SDCPP_REF}" \
+ && git submodule update --init --recursive
+
+WORKDIR /opt/sdcpp
+
+# Print the toolkit's ground-truth arch list for operator verification. The
+# build log will show this right before configure; cross-check CUDA_ARCHS here.
+RUN echo "=== nvcc --list-gpu-arch (CUDA 12.8) ===" && nvcc --list-gpu-arch && \
+    echo "=== CMAKE_CUDA_ARCHITECTURES = ${CUDA_ARCHS} ==="
+
+# IDENTICAL cmake flags to the golden recipe + the one functional add:
+# -DCMAKE_CUDA_ARCHITECTURES. ggml (sd.cpp's CUDA backend) honors the standard
+# CMAKE_CUDA_ARCHITECTURES var; if a future ggml bump ignores it, the fallback
+# is -DGGML_CUDA_ARCHITECTURES with the same value.
+RUN cmake -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DSD_CUDA=ON -DSD_WEBM=ON -DSD_WEBP=ON \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+ && cmake --build build --config Release --target sd-cli -j"$(nproc)"
+
+# Park the binary at a known path for `docker create` + `docker cp` extraction.
+RUN mkdir -p /out \
+ && cp "$(find build -name sd-cli -type f -perm -u+x | head -n1)" /out/sd-cli \
+ && chmod 755 /out/sd-cli \
+ && echo "sd-cli (cu12 fat binary) staged at /out/sd-cli"
+
+# Flag sanity — GPU-FREE. Do NOT run the binary here. The docker BUILD sandbox has
+# no GPU: libcuda is only present at `docker run --gpus`, so `/out/sd-cli --help`
+# can fail to init the CUDA backend and error out BEFORE printing its flags — which
+# would falsely trip "missing flags" on a perfectly good build. Instead, confirm the
+# flag literals are baked into the binary's string table; `strings` needs no CUDA.
+# The real runtime check (--help + a generation) runs WITH the GPU in
+# build-and-validate-sd-cli.sh, the only place the binary can actually execute.
+RUN strings /out/sd-cli | grep -E -- '--ref-image|--llm_vision|vid_gen|--diffusion-fa' \
+      || (echo "BUILD MISSING REQUIRED FLAG LITERALS — wrong ref?" && exit 1)
